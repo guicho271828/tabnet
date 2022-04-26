@@ -38,7 +38,7 @@ class GBN(torch.nn.Module):
         return torch.cat(res, dim=0)
 
 
-class TabNetEncoder(torch.nn.Module):
+class TabNetLayer(torch.nn.Module):
     def __init__(
         self,
         input_dim,
@@ -83,9 +83,9 @@ class TabNetEncoder(torch.nn.Module):
         momentum : float
             Float value between 0 and 1 which will be used for momentum in all batch norm
         mask_type : str
-            Either "sparsemax" or "entmax" : this is the masking function to use
+            Either "sparsemax", "entmax", or None. : this is the masking function to use. When None, masking feature is disabled for decoders
         """
-        super(TabNetEncoder, self).__init__()
+        super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.is_multi_task = isinstance(output_dim, list)
@@ -98,187 +98,90 @@ class TabNetEncoder(torch.nn.Module):
         self.n_shared = n_shared
         self.virtual_batch_size = virtual_batch_size
         self.mask_type = mask_type
-        self.initial_bn = BatchNorm1d(self.input_dim, momentum=0.01)
+        self.feat_transformers = []
+        self.att_transformers = []
 
         if self.n_shared > 0:
+            if mask_type is not None:
+                n_fo = n_d + n_a
+            else:
+                n_fo = n_d
             shared_feat_transform = torch.nn.ModuleList()
             for i in range(self.n_shared):
+                # note: * 2 is for Gated Linear Unit
                 if i == 0:
                     shared_feat_transform.append(
-                        Linear(self.input_dim, 2 * (n_d + n_a), bias=False)
-                    )
+                        Linear(self.input_dim, 2 * n_fo, bias=False))
                 else:
                     shared_feat_transform.append(
-                        Linear(n_d + n_a, 2 * (n_d + n_a), bias=False)
-                    )
+                        Linear(n_fo, 2 * n_fo, bias=False))
 
         else:
             shared_feat_transform = None
 
-        self.initial_splitter = FeatTransformer(
-            self.input_dim,
-            n_d + n_a,
-            shared_feat_transform,
-            n_glu_independent=self.n_independent,
-            virtual_batch_size=self.virtual_batch_size,
-            momentum=momentum,
-        )
+        if mask_type is not None:
+            # encoder
+            for i in range(n_steps+1):
+                f = FeatTransformer(self.input_dim,
+                                    n_fo,
+                                    shared_feat_transform,
+                                    n_glu_independent=self.n_independent,
+                                    virtual_batch_size=self.virtual_batch_size,
+                                    momentum=momentum,)
+                self.feat_transformers.append(f)
+                self.add_module(f"feat_{i}",f)
 
-        self.feat_transformers = torch.nn.ModuleList()
-        self.att_transformers = torch.nn.ModuleList()
-
-        for step in range(n_steps):
-            transformer = FeatTransformer(
-                self.input_dim,
-                n_d + n_a,
-                shared_feat_transform,
-                n_glu_independent=self.n_independent,
-                virtual_batch_size=self.virtual_batch_size,
-                momentum=momentum,
-            )
-            attention = AttentiveTransformer(
-                n_a,
-                self.input_dim,
-                virtual_batch_size=self.virtual_batch_size,
-                momentum=momentum,
-                mask_type=self.mask_type,
-            )
-            self.feat_transformers.append(transformer)
-            self.att_transformers.append(attention)
+            for i in range(n_steps):
+                f = AttentiveTransformer(n_a,
+                                         self.input_dim,
+                                         virtual_batch_size=self.virtual_batch_size,
+                                         momentum=momentum,
+                                         mask_type=self.mask_type,)
+                self.att_transformers.append(f)
+                self.add_module(f"att_{i}",f)
+            self.att_transformers.append(None) # to match the number in a zip iterator later
+            self.last_fc = torch.nn.Linear(n_d, output_dim)
+        else:
+            # decoder
+            for i in range(n_steps):
+                f = FeatTransformer(self.input_dim,
+                                    n_fo,
+                                    shared_feat_transform,
+                                    n_glu_independent=self.n_independent,
+                                    virtual_batch_size=self.virtual_batch_size,
+                                    momentum=momentum,)
+                self.feat_transformers.append(f)
+                self.add_module(f"feat_{i}",f)
+        pass
 
     def forward(self, x, prior=None):
-        x = self.initial_bn(x)
 
-        if prior is None:
-            prior = torch.ones(x.shape).to(x.device)
+        if self.mask_type is not None:
+            mask = torch.ones(x.shape).to(x.device) # no mask initially
+            if prior is None:
+                prior = torch.ones(x.shape).to(x.device)
+            outputs = []
+            masks = []
+            for feat, att in zip(self.feat_transformers, self.att_transformers):
+                masked_x   = torch.mul(mask, x)
+                pre_split  = feat(masked_x)
+                output     = pre_split[:, : self.n_d]
+                outputs.append(output)
 
-        M_loss = 0
-        att = self.initial_splitter(x)[:, self.n_d :]
+                if att is not None:
+                    mask_input = pre_split[:, self.n_d :]
+                    mask       = att(prior, mask_input)
+                    prior      = torch.mul(self.gamma - mask, prior)
+                    masks.append(mask)
 
-        steps_output = []
-        for step in range(self.n_steps):
-            M = self.att_transformers[step](prior, att)
-            M_loss += torch.mean(
-                torch.sum(torch.mul(M, torch.log(M + self.epsilon)), dim=1)
-            )
-            # update prior
-            prior = torch.mul(self.gamma - M, prior)
-            # output
-            masked_x = torch.mul(M, x)
-            out = self.feat_transformers[step](masked_x)
-            d = ReLU()(out[:, : self.n_d])
-            steps_output.append(d)
-            # update attention
-            att = out[:, self.n_d :]
-
-        M_loss /= self.n_steps
-        return steps_output, M_loss
-
-    def forward_masks(self, x):
-        x = self.initial_bn(x)
-
-        prior = torch.ones(x.shape).to(x.device)
-        M_explain = torch.zeros(x.shape).to(x.device)
-        att = self.initial_splitter(x)[:, self.n_d :]
-        masks = {}
-
-        for step in range(self.n_steps):
-            M = self.att_transformers[step](prior, att)
-            masks[step] = M
-            # update prior
-            prior = torch.mul(self.gamma - M, prior)
-            # output
-            masked_x = torch.mul(M, x)
-            out = self.feat_transformers[step](masked_x)
-            d = ReLU()(out[:, : self.n_d])
-            # explain
-            step_importance = torch.sum(d, dim=1)
-            M_explain += torch.mul(M, step_importance.unsqueeze(dim=1))
-            # update attention
-            att = out[:, self.n_d :]
-
-        return M_explain, masks
-
-
-class TabNetDecoder(torch.nn.Module):
-    def __init__(
-        self,
-        input_dim,
-        n_d=8,
-        n_steps=3,
-        n_independent=1,
-        n_shared=1,
-        virtual_batch_size=128,
-        momentum=0.02,
-    ):
-        """
-        Defines main part of the TabNet network without the embedding layers.
-
-        Parameters
-        ----------
-        input_dim : int
-            Number of features
-        output_dim : int or list of int for multi task classification
-            Dimension of network output
-            examples : one for regression, 2 for binary classification etc...
-        n_d : int
-            Dimension of the prediction  layer (usually between 4 and 64)
-        n_steps : int
-            Number of successive steps in the network (usually between 3 and 10)
-        gamma : float
-            Float above 1, scaling factor for attention updates (usually between 1.0 to 2.0)
-        n_independent : int
-            Number of independent GLU layer in each GLU block (default 1)
-        n_shared : int
-            Number of independent GLU layer in each GLU block (default 1)
-        virtual_batch_size : int
-            Batch size for Ghost Batch Normalization
-        momentum : float
-            Float value between 0 and 1 which will be used for momentum in all batch norm
-        """
-        super(TabNetDecoder, self).__init__()
-        self.input_dim = input_dim
-        self.n_d = n_d
-        self.n_steps = n_steps
-        self.n_independent = n_independent
-        self.n_shared = n_shared
-        self.virtual_batch_size = virtual_batch_size
-
-        self.feat_transformers = torch.nn.ModuleList()
-
-        if self.n_shared > 0:
-            shared_feat_transform = torch.nn.ModuleList()
-            for i in range(self.n_shared):
-                if i == 0:
-                    shared_feat_transform.append(Linear(n_d, 2 * n_d, bias=False))
-                else:
-                    shared_feat_transform.append(Linear(n_d, 2 * n_d, bias=False))
+            return self.last_fc(torch.sum( torch.stack(outputs[1:], 0), 0 )), torch.stack( masks  , -2 )
 
         else:
-            shared_feat_transform = None
+            outputs = [ f(x) for f in self.feat_transformers ]
+            return torch.sum( torch.stack(outputs, 0), 0 )
 
-        for step in range(n_steps):
-            transformer = FeatTransformer(
-                n_d,
-                n_d,
-                shared_feat_transform,
-                n_glu_independent=self.n_independent,
-                virtual_batch_size=self.virtual_batch_size,
-                momentum=momentum,
-            )
-            self.feat_transformers.append(transformer)
 
-        self.reconstruction_layer = Linear(n_d, self.input_dim, bias=False)
-        initialize_non_glu(self.reconstruction_layer, n_d, self.input_dim)
-
-    def forward(self, steps_output):
-        res = 0
-        for step_nb, step_output in enumerate(steps_output):
-            x = self.feat_transformers[step_nb](step_output)
-            res = torch.add(res, x)
-        res = self.reconstruction_layer(res)
-        return res
-
+# note: TabNetPretraining, TabNetNoEmbeddings, TabNet classes are now broken due to this change
 
 class AttentiveTransformer(torch.nn.Module):
     def __init__(
