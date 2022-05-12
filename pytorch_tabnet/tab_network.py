@@ -106,25 +106,25 @@ class TabNetLayer(torch.nn.Module):
                 n_fo = n_d + n_a
             else:
                 n_fo = n_d
-            shared_feat_transform = torch.nn.ModuleList()
+            self.shared = torch.nn.ModuleList()
             for i in range(self.n_shared):
                 # note: * 2 is for Gated Linear Unit
                 if i == 0:
-                    shared_feat_transform.append(
+                    self.shared.append(
                         Linear(self.input_dim, 2 * n_fo, bias=False))
                 else:
-                    shared_feat_transform.append(
+                    self.shared.append(
                         Linear(n_fo, 2 * n_fo, bias=False))
 
         else:
-            shared_feat_transform = None
+            self.shared = None
 
         if mask_type is not None:
             # encoder
             for i in range(n_steps+1):
                 f = FeatTransformer(self.input_dim,
                                     n_fo,
-                                    shared_feat_transform,
+                                    self.shared,
                                     n_glu_independent=self.n_independent,
                                     virtual_batch_size=self.virtual_batch_size,
                                     momentum=momentum,)
@@ -146,7 +146,7 @@ class TabNetLayer(torch.nn.Module):
             for i in range(n_steps):
                 f = FeatTransformer(self.input_dim,
                                     n_fo,
-                                    shared_feat_transform,
+                                    self.shared,
                                     n_glu_independent=self.n_independent,
                                     virtual_batch_size=self.virtual_batch_size,
                                     momentum=momentum,)
