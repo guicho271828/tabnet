@@ -119,6 +119,12 @@ class TabNetLayer(torch.nn.Module):
         else:
             self.shared = None
 
+        # Note:
+        # The paper shows there are separate last layer in decoder,
+        # while there is a single last layer in encoder.
+        # Interestingly, the original fork has a single last_fc layer (same as this fork),
+        self.last_fc = torch.nn.Linear(n_d, output_dim)
+
         if mask_type is not None:
             # encoder
             for i in range(n_steps+1):
@@ -140,7 +146,6 @@ class TabNetLayer(torch.nn.Module):
                 self.att_transformers.append(f)
                 self.add_module(f"att_{i}",f)
             self.att_transformers.append(None) # to match the number in a zip iterator later
-            self.last_fc = torch.nn.Linear(n_d, output_dim)
         else:
             # decoder
             for i in range(n_steps):
@@ -178,7 +183,7 @@ class TabNetLayer(torch.nn.Module):
 
         else:
             outputs = [ f(x) for f in self.feat_transformers ]
-            return torch.sum( torch.stack(outputs, 0), 0 )
+            return self.last_fc(torch.sum( torch.stack(outputs, 0), 0 ))
 
 
 # note: TabNetPretraining, TabNetNoEmbeddings, TabNet classes are now broken due to this change
